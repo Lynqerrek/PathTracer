@@ -3,40 +3,37 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>WebGL2 PathTracer with Temporal Reprojection</title>
+<title>PathTracer with Denoiser</title>
 <style>
   html,body { height:100%; margin:0; background:#000; overflow:hidden; }
-  canvas { display:block; width:100vw; height:100vh; cursor: crosshair; }
-  #info {
-    position:fixed; left:12px; top:12px; color:#ddd; font-family:'Segoe UI', monospace;
-    background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:8px; font-size:13px;
-    backdrop-filter: blur(4px); pointer-events:none; user-select: none;
-    border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  canvas { display:block; width:100%; height:100%; }
+  #ui {
+    position:fixed; left:12px; top:12px; color:#ddd; font-family: 'Segoe UI', monospace;
+    background:rgba(20,20,20,0.75); padding:10px 14px; border-radius:8px; font-size:13px;
+    backdrop-filter: blur(4px); border:1px solid rgba(255,255,255,0.1);
+    pointer-events: none; user-select: none;
   }
-  .status-tag {
-    display:inline-block; width:8px; height:8px; border-radius:50%;
-    margin-right:6px; background:#f00;
-  }
+  .label { color:#888; margin-right:5px; }
+  .val { color:#fff; font-weight:bold; }
 </style>
 </head>
 <body>
 <canvas id="glcanvas"></canvas>
-<div id="info">
-  <div style="margin-bottom:4px"><span id="status" class="status-tag"></span><span id="state-text">Initializing...</span></div>
-  <div>Samples: <span id="frame">0</span></div>
+<div id="ui">
+  <div><span class="label">Frame:</span><span id="frameVal" class="val">0</span></div>
+  <div style="margin-top:4px; font-size:11px; color:#aaa">Denoiser Active <span id="denoiseStatus">(Strong)</span></div>
 </div>
 
 <script>
-/* GPU Path Tracer with Temporal Accumulation & SVGF-style Filtering
-   - Replaced "Clear on Move" with "Blend on Move" (EMA)
-   - Implemented Edge-Avoiding Spatial Filter in Display Pass
-   - Added Interaction State Management
+/* GPU Path Tracer + Real-time Denoiser 
+   - Uses a Bilateral Filter (Edge-Avoiding Blur) in the display pass.
+   - Filter strength fades out as accumulation frames increase.
 */
 
 const MAX_SPHERES = 8;
 const MAX_LIGHTS = 4;
 
-// --- Scene Definitions ---
+// --- Scene Definition ---
 const Spheres = [
   { cx: 0, cy: 0.5, cz: -0.5, rad: 1.0, mat: 0 },
   { cx: 1.8, cy: 0.2, cz: 0.5,  rad: 0.7, mat: 1 },
@@ -45,36 +42,36 @@ const Spheres = [
 const Plane = { y: -0.5, mat: 3 };
 const Materials = [
   { r:0.9, g:0.2, b:0.2 }, // Red
-  { r:0.7, g:0.7, b:0.7 }, // Grey/Mirror-ish
+  { r:0.7, g:0.7, b:0.7 }, // Grey
   { r:0.2, g:0.3, b:0.9 }, // Blue
-  { r:0.9, g:0.9, b:0.9 }, // White Floor
+  { r:0.9, g:0.9, b:0.9 }, // Floor
   { r:0.1, g:0.1, b:0.1 }  // Dark
 ];
 
+// Lights: Lights[0] is cursor-attached
 const Lights = [
-  { x: 0.0, y: 4.0, z: 2.0, rad: 0.6, r: 40.0, g: 30.0, b: 25.0 }, // Cursor Light
+  { x: 0.0, y: 4.0, z: 2.0, rad: 0.6, r: 40.0, g: 30.0, b: 25.0 }, 
   { x:-5, y:8, z:5, rad:1.5, r:15, g:15, b:15 },
   { x: 5, y:5, z:2, rad:1.0, r:5, g:5, b:5 }
 ];
 
 const canvas = document.getElementById('glcanvas');
-const infoFrame = document.getElementById('frame');
-const statusTag = document.getElementById('status');
-const statusText = document.getElementById('state-text');
+const uiFrame = document.getElementById('frameVal');
+const uiDenoise = document.getElementById('denoiseStatus');
 
-let gl = canvas.getContext('webgl2', { antialias:false, preserveDrawingBuffer:false, powerPreference: "high-performance" });
+let gl = canvas.getContext('webgl2', { antialias:false, powerPreference:'high-performance' });
 if (!gl) { alert('WebGL2 required'); throw new Error('No WebGL2'); }
 const ext = gl.getExtension('EXT_color_buffer_float');
-if (!ext) console.warn('EXT_color_buffer_float missing - quality degraded');
+if (!ext) console.warn('Float buffer extension missing - quality degraded');
 
-// --- Shaders ---
-
+// --- Vertex Shader (Shared) ---
 const vertSrc = `#version 300 es
 precision highp float;
 layout(location=0) in vec2 a_pos;
 out vec2 v_uv;
 void main(){ v_uv = 0.5*(a_pos+1.0); gl_Position = vec4(a_pos,0.0,1.0); }`;
 
+// --- Path Tracing Shader (Accumulation) ---
 const fragTraceSrc = `#version 300 es
 precision highp float;
 precision highp int;
@@ -83,14 +80,13 @@ out vec4 outColor;
 
 uniform sampler2D u_prevAccum;
 uniform int u_frame;
-uniform float u_blendAlpha; // 1.0 = reset/instant, 0.1 = ghosting, small = converging
 uniform vec2 u_resolution;
 uniform float u_time;
 
 uniform vec3 u_camPos;
-uniform vec3 u_camF;
-uniform vec3 u_camR;
-uniform vec3 u_camU;
+uniform vec3 u_camF; 
+uniform vec3 u_camR; 
+uniform vec3 u_camU; 
 
 uniform int u_sphereCount;
 uniform vec4 u_spheres[${MAX_SPHERES}];
@@ -107,7 +103,7 @@ uniform vec3 u_lightCols[${MAX_LIGHTS}];
 
 #define PI 3.14159265359
 
-// Hash for RNG
+// Random number generation
 uint hash_u(uint x){ x += (x<<10u); x ^= (x>>6u); x += (x<<3u); x ^= (x>>11u); x += (x<<15u); return x; }
 float rnd(inout uint s){ s = hash_u(s); return float(s & 0x00FFFFFFu) / float(0x01000000u); }
 uint seed_from(ivec2 p, int frame, float t) {
@@ -124,44 +120,45 @@ Hit intersectScene(vec3 ro, vec3 rd) {
   Hit h; h.t = 1e20; h.mat = -1;
   
   // Spheres
-  for (int i=0;i<${MAX_SPHERES};++i) {
+  for (int i=0; i<${MAX_SPHERES}; ++i) {
     if (i >= u_sphereCount) break;
     vec4 s = u_spheres[i];
     vec3 oc = vec3(s.x,s.y,s.z) - ro;
     float b = dot(oc, rd);
-    if (b < 0.0) continue;
-    float d2 = dot(oc,oc) - b*b;
-    float r2 = s.w*s.w;
-    if (d2 > r2) continue;
-    float t = b - sqrt(r2 - d2);
+    float det = b*b - dot(oc,oc) + s.w*s.w;
+    if (det < 0.0) continue;
+    float t = b - sqrt(det);
     if (t > 0.001 && t < h.t) {
-      h.t = t; h.p = ro + rd*t; h.n = normalize(h.p - vec3(s.x,s.y,s.z));
+      h.t = t; h.p = ro + rd*t; 
+      h.n = normalize(h.p - vec3(s.x,s.y,s.z));
       h.mat = u_sphereMat[i];
     }
   }
+  
   // Plane
   float denom = rd.y;
   if (abs(denom) > 1e-6) {
-    float tp = (u_planeY - ro.y) / rd.y;
+    float tp = (u_planeY - ro.y) / denom;
     if (tp > 0.001 && tp < h.t) {
-      h.t = tp; h.p = ro + rd*tp; h.n = vec3(0.0,1.0,0.0); h.mat = u_planeMat;
+      h.t = tp; h.p = ro + rd*tp; 
+      h.n = vec3(0.0,1.0,0.0); 
+      h.mat = u_planeMat;
     }
   }
   return h;
 }
 
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
-  for (int i=0;i<${MAX_SPHERES};++i) {
+  for (int i=0; i<${MAX_SPHERES}; ++i) {
     if (i >= u_sphereCount) break;
     vec4 s = u_spheres[i];
     vec3 oc = vec3(s.x,s.y,s.z) - ro;
     float b = dot(oc, rd);
-    if (b < 0.0) continue;
-    float d2 = dot(oc,oc) - b*b;
-    float r2 = s.w*s.w;
-    if (d2 > r2) continue;
-    float t = b - sqrt(r2 - d2);
-    if (t > 0.001 && t < maxDist) return true;
+    float det = b*b - dot(oc,oc) + s.w*s.w;
+    if (det > 0.0) {
+      float t = b - sqrt(det);
+      if (t > 0.001 && t < maxDist) return true;
+    }
   }
   if (rd.y != 0.0) {
     float tp = (u_planeY - ro.y) / rd.y;
@@ -184,213 +181,206 @@ vec3 sampleHemisphere(vec3 n, float r1, float r2) {
 
 void main(){
   ivec2 pix = ivec2(gl_FragCoord.xy);
-  vec2 res = u_resolution;
+  vec4 prev = texture(u_prevAccum, v_uv);
   
-  // Read previous ACCUMULATED AVERAGE (not sum)
-  vec4 prevData = texture(u_prevAccum, v_uv);
-  vec3 prevColor = prevData.rgb;
-
+  // Random seed
   uint state = seed_from(pix, u_frame, u_time);
-
+  
   // Anti-aliasing jitter
-  float jx = rnd(state), jy = rnd(state);
-  vec2 uvJ = ( (gl_FragCoord.xy + vec2(jx, jy)) / res );
-
+  vec2 uvJ = (gl_FragCoord.xy + vec2(rnd(state), rnd(state))) / u_resolution;
+  
   vec3 rd = normalize(u_camF + u_camR * (uvJ.x - 0.5) + u_camU * (uvJ.y - 0.5));
   vec3 ro = u_camPos;
-
+  
+  vec3 accum = vec3(0.0);
   vec3 throughput = vec3(1.0);
-  vec3 radiance = vec3(0.0);
-
-  for (int bounce=0;bounce<4;++bounce) {
+  
+  for (int bounce=0; bounce<3; ++bounce) {
     Hit h = intersectScene(ro, rd);
     
-    // Sky
+    // Original Sky Gradient
     if (h.t > 1e19) {
       float skyT = 0.5 * (rd.y + 1.0);
       vec3 sky = vec3(0.7*(1.0-skyT)+0.1*skyT, 0.8*(1.0-skyT)+0.1*skyT, 1.0*(1.0-skyT)+0.3*skyT);
-      radiance += throughput * sky;
+      accum += throughput * sky;
       break;
     }
-
+    
     vec3 matCol = (h.mat >=0 && h.mat < u_materialCount) ? u_materials[h.mat] : vec3(0.8);
     
-    // Emissive hack (simple glow if far away)
-    if (bounce == 0 && h.t > 15.0) {
-      radiance += throughput * matCol * 1.0;
+    // Original "Headlight" Ambient Effect for distant objects
+    if (h.t > 15.0 && bounce == 0) {
+      float fakeL = 0.2 + max(0.0, h.n.y) * 0.8;
+      accum += throughput * matCol * fakeL;
       break;
     }
-
+    
     vec3 nextRo = h.p + h.n * 0.001;
-
-    // Direct Light Sampling (Next Event Estimation)
+    
+    // Direct Light Sampling
     for (int li=0; li<${MAX_LIGHTS}; ++li) {
       if (li >= u_lightCount) break;
       vec4 L = u_lights[li];
-      vec3 lightPos = vec3(L.x,L.y,L.z);
-      float lrad = L.w;
-
-      // Sample light area
-      float r1 = rnd(state), r2 = rnd(state);
-      float z = 1.0 - r2;
+      vec3 lPos = L.xyz;
+      float lRad = L.w;
+      
+      // Pick random point on light
+      float r1 = rnd(state);
+      float r2 = rnd(state);
+      float z = 1.0 - r2; 
       float phi = 2.0 * PI * r1;
-      vec3 samp = lightPos + lrad * vec3(cos(phi)*sqrt(max(0.0,1.0-z*z)), sin(phi)*sqrt(max(0.0,1.0-z*z)), z);
-
-      vec3 toL = samp - nextRo;
+      float sinTheta = sqrt(max(0.0, 1.0 - z*z));
+      vec3 lSamp = lPos + lRad * vec3(cos(phi)*sinTheta, sin(phi)*sinTheta, (rnd(state)>0.5?1.0:-1.0)*z);
+      
+      vec3 toL = lSamp - nextRo;
       float dist2 = dot(toL,toL);
       float dist = sqrt(dist2);
       vec3 Ldir = toL / dist;
-
+      
       float nl = max(0.0, dot(h.n, Ldir));
       if (nl > 0.0) {
         if (!occluded(nextRo, Ldir, dist - 0.01)) {
-          vec3 Li = u_lightCols[li] / dist2; // Falloff
-          radiance += throughput * matCol * Li * nl;
+          // Original Falloff (Inverse Square Law)
+          vec3 Li = u_lightCols[li] / dist2; 
+          accum += throughput * matCol * Li * nl;
         }
       }
     }
-
-    // Indirect Bounce
-    float r1 = rnd(state), r2 = rnd(state);
-    vec3 newDir = sampleHemisphere(h.n, r1, r2);
+    
+    // Bounce
+    vec3 newDir = sampleHemisphere(h.n, rnd(state), rnd(state));
     rd = newDir; ro = nextRo;
     throughput *= matCol;
-
+    
     // Russian Roulette
-    if (bounce >= 2) {
+    if (bounce >= 1) {
       float p = max(throughput.r, max(throughput.g, throughput.b));
       if (rnd(state) > p) break;
       throughput /= max(1e-6, p);
     }
   }
-
-  // --- TEMPORAL BLEND ---
-  // If moving, u_blendAlpha is ~0.1 (Ghosting)
-  // If static, u_blendAlpha is 1.0 / (frame + 1.0) (Converging)
-  vec3 newAvg = mix(prevColor, radiance, u_blendAlpha);
   
-  // NaN safety
-  if (any(isnan(newAvg))) newAvg = prevColor;
-
-  outColor = vec4(newAvg, 1.0);
+  vec3 newSum = prev.rgb + accum;
+  outColor = vec4(newSum, 1.0);
 }
 `;
 
+// --- Display Shader with Denoiser ---
 const fragDisplaySrc = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 out vec4 fragColor;
 uniform sampler2D u_accum;
+uniform float u_displayFrame;
 uniform vec2 u_resolution;
-uniform bool u_denoise; 
-
-/* Simple Bilateral Spatial Filter 
-   Serves as the spatial part of "SVGF" logic to clean up 
-   the noise from the 10% ghosting trails.
-*/
-vec3 smartBlur() {
-  vec2 texel = 1.0 / u_resolution;
-  vec3 c = texture(u_accum, v_uv).rgb;
-  
-  // If not denoising (e.g. fully converged), just return color
-  if (!u_denoise) return c;
-
-  vec3 sum = c;
-  float wSum = 1.0;
-  
-  // 5-tap cross kernel for speed
-  vec2 offs[4];
-  offs[0] = vec2(1,0); offs[1] = vec2(-1,0);
-  offs[2] = vec2(0,1); offs[3] = vec2(0,-1);
-
-  for (int i=0; i<4; i++) {
-    vec3 s = texture(u_accum, v_uv + offs[i]*texel*1.0).rgb;
-    // Color weight: reduce weight if color is very different (edge preservation)
-    float diff = length(s - c);
-    float w = exp(-diff * 4.0); 
-    sum += s * w;
-    wSum += w;
-  }
-  
-  return sum / wSum;
-}
 
 void main(){
-  vec3 col = smartBlur();
+  ivec2 coord = ivec2(gl_FragCoord.xy);
   
-  // Tone mapping (ACEish)
-  col = col / (col + 0.15); 
+  // Get center pixel
+  vec3 centerSum = texelFetch(u_accum, coord, 0).rgb;
+  vec3 centerVal = centerSum / max(1.0, u_displayFrame);
   
-  // Gamma
-  col = pow(col, vec3(1.0/2.2));
+  // DENOISER LOGIC
+  vec3 finalColor = centerVal;
   
-  // Dither
-  float d = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233))) * 43758.5453) - 0.5;
-  col += d * (1.0/255.0);
-
-  fragColor = vec4(col,1.0);
+  if (u_displayFrame < 60.0) {
+     float sigmaSpace = 1.0;
+     // Tighten color tolerance as we get more samples so we don't blur accumulated detail
+     float sigmaColor = 0.5 / (1.0 + u_displayFrame * 0.05); 
+     
+     vec3 sum = vec3(0.0);
+     float wSum = 0.0;
+     
+     // 5x5 kernel
+     for(int x=-2; x<=2; ++x){
+       for(int y=-2; y<=2; ++y){
+         ivec2 tapCoord = coord + ivec2(x,y);
+         vec3 tapVal = texelFetch(u_accum, tapCoord, 0).rgb / max(1.0, u_displayFrame);
+         
+         // Spatial Weight
+         float d2 = float(x*x + y*y);
+         float wS = exp(-d2 / (2.0 * sigmaSpace * sigmaSpace));
+         
+         // Color Weight (Edge avoiding)
+         vec3 diff = tapVal - centerVal;
+         float lumDist = dot(diff, diff);
+         float wC = exp(-lumDist / (0.01 + 2.0 * sigmaColor * sigmaColor));
+         
+         float w = wS * wC;
+         sum += tapVal * w;
+         wSum += w;
+       }
+     }
+     finalColor = sum / wSum;
+  }
+  
+  // Original Simple Tone Mapping (Sqrt Gamma)
+  vec3 col = sqrt(max(vec3(0.0), finalColor));
+  fragColor = vec4(col, 1.0);
 }
 `;
 
 // --- GL Boilerplate ---
-function createShader(src, type) {
+function compile(src, type) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
-    console.error(gl.getShaderInfoLog(s)); throw new Error("Shader Error");
-  }
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
   return s;
 }
-function createProgram(vs, fs) {
+function link(vs, fs) {
   const p = gl.createProgram();
   gl.attachShader(p, vs); gl.attachShader(p, fs);
   gl.linkProgram(p);
-  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("Link Error");
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   return p;
 }
 
-const vs = createShader(vertSrc, gl.VERTEX_SHADER);
-const fsTrace = createShader(fragTraceSrc, gl.FRAGMENT_SHADER);
-const fsDisp = createShader(fragDisplaySrc, gl.FRAGMENT_SHADER);
-const progTrace = createProgram(vs, fsTrace);
-const progDisp = createProgram(vs, fsDisp);
+const vs = compile(vertSrc, gl.VERTEX_SHADER);
+const fsTrace = compile(fragTraceSrc, gl.FRAGMENT_SHADER);
+const fsDisplay = compile(fragDisplaySrc, gl.FRAGMENT_SHADER);
+const progTrace = link(vs, fsTrace);
+const progDisplay = link(vs, fsDisplay);
 
-const locsTrace = {
+// Quad
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+// Locations
+const locTrace = {
   prev: gl.getUniformLocation(progTrace, 'u_prevAccum'),
   frame: gl.getUniformLocation(progTrace, 'u_frame'),
-  blend: gl.getUniformLocation(progTrace, 'u_blendAlpha'),
   res: gl.getUniformLocation(progTrace, 'u_resolution'),
   time: gl.getUniformLocation(progTrace, 'u_time'),
   camPos: gl.getUniformLocation(progTrace, 'u_camPos'),
   camF: gl.getUniformLocation(progTrace, 'u_camF'),
   camR: gl.getUniformLocation(progTrace, 'u_camR'),
   camU: gl.getUniformLocation(progTrace, 'u_camU'),
-  // Scene uniforms loaded dynamically
+  // Scene uniforms location fetching done in loop later for brevity
 };
-const locsDisp = {
-  tex: gl.getUniformLocation(progDisp, 'u_accum'),
-  res: gl.getUniformLocation(progDisp, 'u_resolution'),
-  denoise: gl.getUniformLocation(progDisp, 'u_denoise')
+const locDisplay = {
+  accum: gl.getUniformLocation(progDisplay, 'u_accum'),
+  frame: gl.getUniformLocation(progDisplay, 'u_displayFrame'),
+  res: gl.getUniformLocation(progDisplay, 'u_resolution')
 };
-
-// Quad
-const quadBuffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]), gl.STATIC_DRAW);
 
 // Buffers
 let tex = [null, null], fb = [null, null];
-function initBuffers(w,h) {
-  tex.forEach(t => t && gl.deleteTexture(t));
-  fb.forEach(f => f && gl.deleteFramebuffer(f));
-  
+let width=0, height=0;
+
+function initBuffers(w, h) {
+  width = w; height = h;
   for(let i=0; i<2; i++) {
+    if (tex[i]) { gl.deleteTexture(tex[i]); gl.deleteFramebuffer(fb[i]); }
     tex[i] = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex[i]);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     
     fb[i] = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb[i]);
@@ -398,237 +388,220 @@ function initBuffers(w,h) {
   }
 }
 
-// --- Logic & State ---
-let width=1, height=1;
-let frameCount = 0;
-let isMoving = false; // "Moving" state for blending logic
-let moveTimer = null; // Timer to debounce movement
-
-// Camera
-let cam = { dist: 7.0, azi: Math.PI/2+0.5, ele: 0.4, target:[0,0.2,0] };
+// --- Camera & State ---
+let frame = 0;
+let camState = { dist: 7.0, azi: 1.57+0.5, ele: 0.4, target: [0,0.2,0] };
 let camVecs = { pos:[0,0,0], f:[0,0,0], r:[0,0,0], u:[0,0,0] };
 
 function updateCamVecs() {
-  const y = cam.dist * Math.sin(cam.ele);
-  const r = cam.dist * Math.cos(cam.ele);
+  const y = camState.dist * Math.sin(camState.ele);
+  const r = camState.dist * Math.cos(camState.ele);
   camVecs.pos = [
-    cam.target[0] + r * Math.sin(cam.azi),
-    cam.target[1] + y,
-    cam.target[2] + r * Math.cos(cam.azi)
+    camState.target[0] + r * Math.sin(camState.azi),
+    camState.target[1] + y,
+    camState.target[2] + r * Math.cos(camState.azi)
   ];
   
-  // Fwd
-  let f = [cam.target[0]-camVecs.pos[0], cam.target[1]-camVecs.pos[1], cam.target[2]-camVecs.pos[2]];
-  let len = Math.hypot(f[0],f[1],f[2]);
-  camVecs.f = [f[0]/len, f[1]/len, f[2]/len];
+  // Forward
+  const fRaw = [camState.target[0]-camVecs.pos[0], camState.target[1]-camVecs.pos[1], camState.target[2]-camVecs.pos[2]];
+  const fLen = Math.hypot(...fRaw);
+  const f = fRaw.map(v=>v/fLen);
   
   // Right
-  let rgt = [camVecs.f[1]*0 - camVecs.f[2]*1, camVecs.f[2]*0 - camVecs.f[0]*0, camVecs.f[0]*1 - camVecs.f[1]*0]; // Cross Y-up
-  // Fix cross product logic properly
-  // Right = Cross(F, WorldUp(0,1,0))
-  // x = f.y*0 - f.z*1 = -f.z
-  // y = f.z*0 - f.x*0 = 0
-  // z = f.x*1 - f.y*0 = f.x
-  rgt = [-camVecs.f[2], 0, camVecs.f[0]];
-  len = Math.hypot(rgt[0],rgt[1],rgt[2]);
-  if(len<0.001) rgt=[1,0,0]; else rgt=[rgt[0]/len, rgt[1]/len, rgt[2]/len];
-  camVecs.r = rgt;
+  let rRaw = [f[1]*0 - f[2]*1, f[2]*0 - f[0]*0, f[0]*1 - f[1]*0]; // Cross(f, worldUp(0,1,0))
+  if (Math.hypot(...rRaw)<0.01) rRaw=[1,0,0];
+  const rLen = Math.hypot(...rRaw);
+  const rgt = rRaw.map(v=>v/rLen);
+  
+  // Up
+  let uRaw = [rgt[1]*f[2] - rgt[2]*f[1], rgt[2]*f[0] - rgt[0]*f[2], rgt[0]*f[1] - rgt[1]*f[0]];
+  // Normalized up needed for cursor calc
+  const uLen = Math.hypot(...uRaw);
+  const uNorm = uRaw.map(v=>v/uLen);
+  
+  // Scale
+  const fov = 60 * Math.PI/180;
+  const aspect = width/height;
+  const vpH = 2 * Math.tan(fov/2);
+  const vpW = vpH * aspect;
+  
+  camVecs.f = f;
+  camVecs.r = rgt.map(v=>v*vpW);
+  camVecs.u = uNorm.map(v=>v*vpH); // camU is scaled
+  
+  resetFrame();
+}
 
-  // Up = Cross(R, F)
-  camVecs.u = [
-    camVecs.r[1]*camVecs.f[2] - camVecs.r[2]*camVecs.f[1],
-    camVecs.r[2]*camVecs.f[0] - camVecs.r[0]*camVecs.f[2],
-    camVecs.r[0]*camVecs.f[1] - camVecs.r[1]*camVecs.f[0]
+function resetFrame() {
+  frame = 0;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[0]); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[1]); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+}
+
+// --- Interaction ---
+// Restoring Original Mouse Logic exactly
+let dragging = false, lx=0, ly=0;
+canvas.addEventListener('mousedown', e=>{ dragging=true; lx=e.clientX; ly=e.clientY; });
+window.addEventListener('mouseup', ()=>dragging=false);
+
+function updateCursorLightFromMouse(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const px = (clientX - rect.left) * dpr;
+  const py = (clientY - rect.top) * dpr;
+  
+  const u = px / canvas.width;
+  const v = py / canvas.height;
+  
+  const ux = u - 0.5;
+  const vy = v - 0.5; 
+  
+  const F = camVecs.f; 
+  const R = camVecs.r; 
+  const U = camVecs.u;
+  
+  let rd = [
+    F[0] + R[0]*ux + U[0]*vy,
+    F[1] + R[1]*ux + U[1]*vy,
+    F[2] + R[2]*ux + U[2]*vy
   ];
   
-  // Scale to viewport
-  const fov = 60 * Math.PI/180;
-  const vpH = 2.0 * Math.tan(fov/2);
-  const vpW = vpH * (width/height);
+  const len = Math.hypot(rd[0], rd[1], rd[2]) || 1;
+  rd = [rd[0]/len, rd[1]/len, rd[2]/len];
   
-  camVecs.r = camVecs.r.map(v => v*vpW);
-  camVecs.u = camVecs.u.map(v => v*vpH);
+  const lightDistance = 6.0;
+  const pos = [ 
+    camVecs.pos[0] + rd[0]*lightDistance, 
+    camVecs.pos[1] + rd[1]*lightDistance, 
+    camVecs.pos[2] + rd[2]*lightDistance 
+  ];
+  
+  Lights[0].x = pos[0];
+  Lights[0].y = pos[1];
+  Lights[0].z = pos[2];
+  
+  resetFrame();
 }
 
-// Interaction
-function triggerMove() {
-  isMoving = true;
-  frameCount = 0; // Logically reset convergence counter
-  
-  statusTag.style.background = '#0f0'; // Green for Moving (Ghosting active)
-  statusTag.style.boxShadow = '0 0 8px #0f0';
-  statusText.textContent = "Moving (Ghosting)";
-
-  if(moveTimer) clearTimeout(moveTimer);
-  moveTimer = setTimeout(() => {
-    isMoving = false;
-    frameCount = 0; // Reset again to start clean convergence from the ghosted state
-    
-    statusTag.style.background = '#fa0'; // Orange for Converging
-    statusTag.style.boxShadow = 'none';
-    statusText.textContent = "Converging...";
-  }, 150); // Keep "moving" state for 150ms after last event
-}
-
-window.addEventListener('resize', () => {
-  const dpr = Math.min(window.devicePixelRatio||1, 2);
-  width = Math.floor(window.innerWidth*dpr);
-  height = Math.floor(window.innerHeight*dpr);
-  canvas.width = width; canvas.height = height;
-  initBuffers(width, height);
-  triggerMove();
-});
-
-let dragging = false, lastX=0, lastY=0;
-canvas.addEventListener('mousedown', e => { dragging=true; lastX=e.clientX; lastY=e.clientY; });
-window.addEventListener('mouseup', () => dragging=false);
-window.addEventListener('mousemove', e => {
-  if(dragging) {
-    const dx = (e.clientX - lastX)*0.005;
-    const dy = (e.clientY - lastY)*0.005;
-    cam.azi -= dx;
-    cam.ele = Math.max(-1.5, Math.min(1.5, cam.ele + dy));
+canvas.addEventListener('mousemove', e=>{
+  if (dragging) {
+    const dx = (e.clientX - lx) * 0.005;
+    const dy = (e.clientY - ly) * 0.005;
+    camState.azi -= dx;
+    camState.ele = Math.max(-1.5, Math.min(1.5, camState.ele + dy));
+    lx = e.clientX; ly = e.clientY;
     updateCamVecs();
-    triggerMove();
-    lastX=e.clientX; lastY=e.clientY;
   } else {
-    // Cursor light
-    updateCursorLight(e.clientX, e.clientY);
+    updateCursorLightFromMouse(e.clientX, e.clientY);
   }
 });
-canvas.addEventListener('wheel', e => {
+
+canvas.addEventListener('wheel', e=>{
   e.preventDefault();
-  cam.dist = Math.max(2, Math.min(20, cam.dist + e.deltaY*0.01));
+  camState.dist = Math.max(2, Math.min(20, camState.dist + e.deltaY*0.01));
   updateCamVecs();
-  triggerMove();
 }, {passive:false});
 
-function updateCursorLight(cx, cy) {
-  const rect = canvas.getBoundingClientRect();
-  const dpr = canvas.width / rect.width;
-  const u = (cx - rect.left) * dpr / canvas.width;
-  const v = (cy - rect.top) * dpr / canvas.height;
-  
-  // Reconstruct ray
-  const ux = u - 0.5, vy = v - 0.5; // v is flipped in shader, handled by camU
-  // Wait, in shader v_uv is 0 at bottom. ClientY is 0 at top.
-  // We need to flip V for logic to match shader visual
-  const vf = (1.0 - v) - 0.5; 
-
-  // Ray direction
-  let rd = [
-    camVecs.f[0] + camVecs.r[0]*ux + camVecs.u[0]*vf,
-    camVecs.f[1] + camVecs.r[1]*ux + camVecs.u[1]*vf,
-    camVecs.f[2] + camVecs.r[2]*ux + camVecs.u[2]*vf
-  ];
-  const len = Math.hypot(rd[0],rd[1],rd[2]);
-  rd = rd.map(x=>x/len);
-  
-  const dist = 6.0;
-  Lights[0].x = camVecs.pos[0] + rd[0]*dist;
-  Lights[0].y = camVecs.pos[1] + rd[1]*dist;
-  Lights[0].z = camVecs.pos[2] + rd[2]*dist;
-  
-  triggerMove(); // Light movement counts as scene movement
-}
-
-// Upload Uniforms
-function uploadScene() {
+// --- Upload Helpers ---
+function setUniforms() {
   gl.uniform1i(gl.getUniformLocation(progTrace, 'u_sphereCount'), Spheres.length);
   Spheres.forEach((s,i) => {
-    gl.uniform4f(gl.getUniformLocation(progTrace, `u_spheres[${i}]`), s.cx, s.cy, s.cz, s.rad);
+    gl.uniform4f(gl.getUniformLocation(progTrace, `u_spheres[${i}]`), s.cx,s.cy,s.cz,s.rad);
     gl.uniform1i(gl.getUniformLocation(progTrace, `u_sphereMat[${i}]`), s.mat);
   });
   gl.uniform1f(gl.getUniformLocation(progTrace, 'u_planeY'), Plane.y);
   gl.uniform1i(gl.getUniformLocation(progTrace, 'u_planeMat'), Plane.mat);
+  
+  gl.uniform1i(gl.getUniformLocation(progTrace, 'u_materialCount'), Materials.length);
   Materials.forEach((m,i) => {
     gl.uniform3f(gl.getUniformLocation(progTrace, `u_materials[${i}]`), m.r, m.g, m.b);
   });
-  gl.uniform1i(gl.getUniformLocation(progTrace, 'u_materialCount'), Materials.length);
+  
   gl.uniform1i(gl.getUniformLocation(progTrace, 'u_lightCount'), Lights.length);
-  Lights.forEach((L,i) => {
-    gl.uniform4f(gl.getUniformLocation(progTrace, `u_lights[${i}]`), L.x, L.y, L.z, L.rad);
-    gl.uniform3f(gl.getUniformLocation(progTrace, `u_lightCols[${i}]`), L.r, L.g, L.b);
+  Lights.forEach((l,i) => {
+    gl.uniform4f(gl.getUniformLocation(progTrace, `u_lights[${i}]`), l.x, l.y, l.z, l.rad);
+    gl.uniform3f(gl.getUniformLocation(progTrace, `u_lightCols[${i}]`), l.r, l.g, l.b);
   });
 }
 
 // --- Render Loop ---
-let writeIdx = 0;
+let ping = 0;
 
-function render() {
-  const readIdx = 1 - writeIdx;
+function draw() {
+  const pong = 1 - ping;
   
-  // 1. Trace & Accumulate
+  // 1. Trace Pass
   gl.useProgram(progTrace);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[writeIdx]);
-  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  gl.enableVertexAttribArray(0);
-  
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, tex[readIdx]);
-  gl.uniform1i(locsTrace.prev, 0);
-  
-  gl.uniform1i(locsTrace.frame, frameCount);
-  gl.uniform2f(locsTrace.res, width, height);
-  gl.uniform1f(locsTrace.time, performance.now()*0.001);
-  
-  gl.uniform3fv(locsTrace.camPos, camVecs.pos);
-  gl.uniform3fv(locsTrace.camF, camVecs.f);
-  gl.uniform3fv(locsTrace.camR, camVecs.r);
-  gl.uniform3fv(locsTrace.camU, camVecs.u);
-  
-  uploadScene();
-  
-  // --- BLENDING LOGIC ---
-  // If Moving: blend = 0.1 (10% new, 90% old) -> Ghosting
-  // If Static: blend = 1 / (N+1) -> Converging average
-  let blendFactor = 0.1;
-  if (!isMoving) {
-    blendFactor = 1.0 / (frameCount + 1.0);
-  }
-  gl.uniform1f(locsTrace.blend, blendFactor);
-  
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb[ping]);
   gl.viewport(0,0,width,height);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
   
-  // 2. Display
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.useProgram(progDisp);
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, tex[writeIdx]); // Read what we just wrote
-  gl.uniform1i(locsDisp.tex, 0);
-  gl.uniform2f(locsDisp.res, width, height);
+  gl.bindTexture(gl.TEXTURE_2D, tex[pong]);
+  gl.uniform1i(locTrace.prev, 0);
   
-  // Enable Spatial Denoise if we are moving (ghosting phase) or early in convergence
-  // This cleans up the noise that makes the ghosting look grainy
-  const needsDenoise = isMoving || frameCount < 20;
-  gl.uniform1i(locsDisp.denoise, needsDenoise ? 1 : 0);
+  gl.uniform1i(locTrace.frame, frame);
+  gl.uniform2f(locTrace.res, width, height);
+  gl.uniform1f(locTrace.time, performance.now()*0.001);
+  
+  gl.uniform3fv(locTrace.camPos, camVecs.pos);
+  gl.uniform3fv(locTrace.camF, camVecs.f);
+  gl.uniform3fv(locTrace.camR, camVecs.r);
+  gl.uniform3fv(locTrace.camU, camVecs.u);
+  
+  setUniforms();
+  
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  
+  // 2. Display Pass (Denoise & Tone)
+  gl.useProgram(progDisplay);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0,0,width,height);
+  
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[ping]);
+  gl.uniform1i(locDisplay.accum, 0);
+  gl.uniform1f(locDisplay.frame, frame + 1.0);
+  gl.uniform2f(locDisplay.res, width, height);
   
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   
-  writeIdx = readIdx; // Swap
-  if(!isMoving) frameCount++;
+  // Update state
+  frame++;
+  ping = pong;
   
-  infoFrame.innerText = frameCount;
-  if(!isMoving && frameCount > 200 && statusText.textContent !== "Converged") {
-    statusTag.style.background = '#44f';
-    statusText.textContent = "Converged";
+  uiFrame.textContent = frame;
+  if(frame < 60) {
+    uiDenoise.textContent = "(Active)";
+    uiDenoise.style.color = "#4f4";
+  } else {
+    uiDenoise.textContent = "(Off - High Detail)";
+    uiDenoise.style.color = "#888";
   }
   
-  requestAnimationFrame(render);
+  requestAnimationFrame(draw);
 }
 
-// Init
-window.onload = () => {
+// --- Init ---
+function onResize() {
   const dpr = Math.min(window.devicePixelRatio||1, 2);
-  width = Math.floor(window.innerWidth*dpr);
-  height = Math.floor(window.innerHeight*dpr);
-  canvas.width = width; canvas.height = height;
-  initBuffers(width, height);
+  canvas.width = window.innerWidth * dpr;
+  canvas.height = window.innerHeight * dpr;
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
+  initBuffers(canvas.width, canvas.height);
   updateCamVecs();
-  render();
-};
+  
+  // Init light position
+  updateCursorLightFromMouse(canvas.width/2/dpr, canvas.height/2/dpr);
+}
+window.addEventListener('resize', onResize);
+
+onResize();
+requestAnimationFrame(draw);
+
 </script>
 </body>
 </html>
