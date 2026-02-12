@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>GPU Path Tracer — Fragment Shader</title>
+<style>
+  html,body { height:100%; margin:0; background:#000; }
+  #glcanvas { display:block; width:100vw; height:100vh; }
+  #msg { position:fixed; left:8px; top:8px; color:#ddd; font-family:monospace; background:rgba(0,0,0,0.6); padding:6px 10px; border-radius:6px; }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="msg"></div>
+
+<script>
+/*
+ WebGL2 GPU Path Tracer
+ - All intersection/lighting work happens in the fragment shader.
+ - Fullscreen, DPR-aware, accumulates on GPU using additive blending into a float texture.
+ - Resizing, camera movement resets accumulation.
+ - Requires WebGL2 and EXT_color_buffer_float.
+*/
+
+const VERT_SRC = `#version 300 es
+precision highp float;
+in vec2 a_pos;
+out vec2 v_uv;
+void main(){
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+
+// Fragment shader that produces a single sample color (float RGB) for current pixel & frame
+const FRAG_SAMPLE_SRC = `#version 300 es
+precision highp float;
+precision highp int;
+out vec4 outColor; // this will be add-blended into the accumulation texture
+
+in vec2 v_uv;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform int u_frame;          // starting at 0 for first sample after reset
+uniform vec3 u_camPos;
+uniform vec3 u_camForward;
+uniform vec3 u_camRight;
+uniform vec3 u_camUp;
+uniform float u_fov;          // vertical fov radians
+uniform float u_aspect;
+
+#define MAX_SPH 8
+#define MAX_LIGHTS 8
+
+uniform int u_sphereCount;
+uniform vec4 u_spheres[MAX_SPH]; // (x,y,z,r)
+uniform int u_sphereMatIdx[MAX_SPH];
+
+uniform int u_matCount;
+uniform vec3 u_mats[16]; // simple diffuse rgb for each material
+
+uniform int u_lightCount;
+uniform vec4 u_lights[MAX_LIGHTS]; // (x,y,z,rad)
+uniform vec3 u_lightCols[MAX_LIGHTS];
+
+const float PI = 3.141592653589793;
+const float SHADOW_BIAS = 0.001;
+const float TRACE_LIMIT = 15.0;
+
+uint wang_hash(uint seed) {
+  seed = (seed ^ 61u) ^ (seed >> 16);
+  seed *= 9u;
+  seed = seed ^ (seed >> 4);
+  seed *= 0x27d4eb2du;
+  seed = seed ^ (seed >> 15);
+  return seed;
+}
+float rnd(inout uint state) {
+  state = wang_hash(state);
+  return float(state) / 4294967296.0;
+}
+
+struct Hit {
+  float t;
+  int hitType; // 0 none, 1 sphere, 2 plane
+  int mat;
+  vec3 pos;
+  vec3 n;
+};
+
+Hit intersectScene(vec3 ro, vec3 rd) {
+  Hit res; res.t = 1e20; res.hitType = 0; res.mat = 0;
+  // spheres
+  for (int i=0;i<MAX_SPH;i++){
+    if(i>=u_sphereCount) break;
+    vec4 s = u_spheres[i];
+    vec3 oc = vec3(s.x,s.y,s.z) - ro;
+    float b = dot(oc, rd);
+    if (b < 0.0) continue;
+    float r2 = s.w*s.w;
+    float d2 = dot(oc,oc) - b*b;
+    if (d2 > r2) continue;
+    float t = b - sqrt(max(0.0, r2 - d2));
+    if (t > 0.001 && t < res.t) {
+      res.t = t;
+      res.hitType = 1;
+      res.mat = u_sphereMatIdx[i];
+      res.pos = ro + rd * t;
+      res.n = normalize(res.pos - vec3(s.x,s.y,s.z));
+    }
+  }
+  // plane y = -0.5
+  float py = -0.5;
+  if (abs(rd.y) > 1e-6) {
+    float t = (py - ro.y) / rd.y;
+    if (t > 0.001 && t < res.t) {
+      res.t = t;
+      res.hitType = 2;
+      res.mat = 3; // floor material by default
+      res.pos = ro + rd * t;
+      res.n = vec3(0.0,1.0,0.0);
+      // checkerboard material override
+      float cx = floor(res.pos.x);
+      float cz = floor(res.pos.z);
+      if (mod(cx + cz, 2.0) != 0.0) res.mat = 4; // dark check
+    }
+  }
+  return res;
+}
+
+bool intersectShadow(vec3 ro, vec3 rd, float maxDist){
+  // spheres
+  for (int i=0;i<MAX_SPH;i++){
+    if(i>=u_sphereCount) break;
+    vec4 s = u_spheres[i];
+    vec3 oc = vec3(s.x,s.y,s.z) - ro;
+    float b = dot(oc, rd);
+    if (b < 0.0) continue;
+    float r2 = s.w*s.w;
+    float d2 = dot(oc,oc) - b*b;
+    if (d2 > r2) continue;
+    float t = b - sqrt(max(0.0, r2 - d2));
+    if (t > SHADOW_BIAS && t < maxDist) return true;
+  }
+  // plane
+  float py = -0.5;
+  if (abs(rd.y) > 1e-6) {
+    float t = (py - ro.y) / rd.y;
+    if (t > SHADOW_BIAS && t < maxDist) return true;
+  }
+  return false;
+}
+
+vec3 sampleHemisphere(vec3 n, float u1, float u2) {
+  // cosine-weighted hemisphere
+  float r = sqrt(u1);
+  float theta = 2.0 * PI * u2;
+  vec3 tangent = abs(n.x) > 0.1 ? normalize(cross(n, vec3(0.0,1.0,0.0))) : normalize(cross(n, vec3(1.0,0.0,0.0)));
+  vec3 bit = cross(n, tangent);
+  return normalize(tangent * (r * cos(theta)) + bit * (r * sin(theta)) + n * sqrt(max(0.0, 1.0 - u1)));
+}
+
+void main(){
+  // compute pixel ray
+  vec2 pixel = v_uv * u_resolution;
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+
+  // RNG state seeded by pixel + frame
+  uint seed = uint(u_frame) * 1973u + uint(ip.x) * 9277u + uint(ip.y) * 2663u + 0x9e3779b9u;
+  // jittered uv for AA
+  float jx = rnd(seed);
+  float jy = rnd(seed);
+  vec2 uv = (pixel + vec2(jx, jy)) / u_resolution;
+  // map to screen space
+  float ndcY = (1.0 - uv.y) * 2.0 - 1.0;
+  float ndcX = (uv.x * 2.0 - 1.0) * u_aspect;
+  // build ray in world space (use camera basis)
+  float vpH = 2.0 * tan(u_fov * 0.5);
+  vec3 rayDir = normalize(u_camForward + u_camRight * ndcX * vpH * 0.5 + u_camUp * ndcY * vpH * 0.5);
+
+  vec3 acc = vec3(0.0);
+  vec3 mask = vec3(1.0);
+
+  vec3 ro = u_camPos;
+  vec3 rd = rayDir;
+
+  // multiple bounces (small number)
+  for (int depth=0; depth<4; depth++){
+    Hit h = intersectScene(ro, rd);
+    if (h.hitType == 0){
+      // environment sky
+      float t = 0.5 * (rd.y + 1.0);
+      vec3 sky = mix(vec3(0.7,0.8,1.0)*0.1 + vec3(0.6,0.7,0.8)*0.6, vec3(0.1,0.1,0.3), t);
+      acc += mask * sky;
+      break;
+    }
+
+    vec3 matCol = u_mats[h.mat];
+    // quick LOD: if first hit far away, fake shading
+    if (h.t > TRACE_LIMIT && depth == 0){
+      float fake = 0.2 + max(0.0, h.n.y) * 0.8;
+      acc += mask * matCol * fake;
+      break;
+    }
+
+    // direct lighting (sample one random light)
+    if (u_lightCount > 0) {
+      int li = int(floor(rnd(seed) * float(u_lightCount)));
+      li = clamp(li, 0, u_lightCount-1);
+      vec4 L = u_lights[li];
+      vec3 Lcol = u_lightCols[li];
+
+      // sample point on small disk around light (simple)
+      float ar1 = rnd(seed) * 2.0 * PI;
+      float ar2 = rnd(seed);
+      float r = L.w * sqrt(ar2);
+      vec3 pOnLight = vec3(L.x, L.y, L.z) + vec3(r * cos(ar1), r * sin(ar1), 0.0);
+
+      vec3 ldir = pOnLight - (h.pos + h.n * SHADOW_BIAS);
+      float dist2 = dot(ldir, ldir);
+      float dist = sqrt(dist2);
+      ldir /= dist;
+      float ndotl = max(0.0, dot(ldir, h.n));
+      if (ndotl > 0.0 && !intersectShadow(h.pos + h.n * SHADOW_BIAS, ldir, dist - 0.01)) {
+        float intensity = ndotl / dist2;
+        acc += mask * matCol * Lcol * intensity * 4.0; // scale to make lights visible
+      }
+    }
+
+    // diffuse bounce
+    float u1 = rnd(seed);
+    float u2 = rnd(seed);
+    vec3 newDir = sampleHemisphere(h.n, u1, u2);
+    ro = h.pos + h.n * SHADOW_BIAS;
+    rd = newDir;
+    mask *= matCol;
+
+    // Russian roulette
+    if (depth >= 2) {
+      float p = max(mask.r, max(mask.g, mask.b));
+      if (rnd(seed) > p) break;
+      mask /= p;
+    }
+  }
+
+  outColor = vec4(acc, 1.0);
+}
+`;
+
+// Simple pass to display average = accumTex / frameCount with gamma correction
+const FRAG_DISPLAY_SRC = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform sampler2D u_accum;
+uniform int u_frame; // frames accumulated (>=1)
+void main(){
+  vec3 sum = texture(u_accum, v_uv).rgb;
+  float f = max(1, u_frame);
+  vec3 col = sum / float(f);
+  // gamma ~ 2.0 (sqrt)
+  col = sqrt(col);
+  outColor = vec4(col, 1.0);
+}
+`;
+
+// ---- Utility: compile shader/program ----
+function createShader(gl, type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    const log = gl.getShaderInfoLog(s);
+    console.error("Shader compile error", log);
+    throw new Error(log);
+  }
+  return s;
+}
+function createProgram(gl, vsrc, fsrc){
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsrc);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+    const log = gl.getProgramInfoLog(p);
+    console.error("Program link error", log);
+    throw new Error(log);
+  }
+  return p;
+}
+
+// ---- Setup GL and resources ----
+const canvas = document.getElementById('glcanvas');
+const msg = document.getElementById('msg');
+
+let gl = canvas.getContext('webgl2', {antialias:false, preserveDrawingBuffer:false});
+if(!gl) {
+  msg.textContent = "WebGL2 not supported in this browser.";
+  throw new Error("No WebGL2");
+}
+const ext = gl.getExtension('EXT_color_buffer_float');
+if(!ext){
+  msg.textContent = "EXT_color_buffer_float not available. Browser may not support rendering to float textures.";
+  throw new Error("No EXT_color_buffer_float");
+}
+
+// full-screen quad
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+const quadVerts = new Float32Array([
+  -1,-1,  1,-1,  -1,1,
+  -1,1,   1,-1,   1,1
+]);
+gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+
+// programs
+const progSample = createProgram(gl, VERT_SRC, FRAG_SAMPLE_SRC);
+const progDisplay = createProgram(gl, VERT_SRC, FRAG_DISPLAY_SRC);
+
+// attribute locations
+const a_pos_loc = gl.getAttribLocation(progSample, 'a_pos');
+const a_pos_loc_disp = gl.getAttribLocation(progDisplay, 'a_pos');
+
+// accumulation texture & framebuffer
+let accumTex = null;
+let accumFBO = null;
+
+function createAccumTexture(w,h){
+  if(accumTex) gl.deleteTexture(accumTex);
+  if(accumFBO) gl.deleteFramebuffer(accumFBO);
+  accumTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, accumTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  accumFBO = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accumTex, 0);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if(status !== gl.FRAMEBUFFER_COMPLETE) {
+    console.error("FBO incomplete", status);
+    throw new Error("FBO incomplete");
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// full-screen resize handling
+let dpr = window.devicePixelRatio || 1;
+function resizeCanvas(){
+  dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  gl.viewport(0,0,w,h);
+  createAccumTexture(w,h);
+  resetAccumulation();
+}
+window.addEventListener('resize', () => resizeCanvas());
+resizeCanvas();
+
+// scene (maps from user's original CPU arrays)
+const SPHERES = [
+  {cx: 0, cy: 0.5, cz: -0.5, rad: 1.0, mat: 0},
+  {cx: 1.8, cy: 0.2, cz: 0.5, rad: 0.7, mat: 1},
+  {cx: -1.8, cy: 0.2, cz: 0.0, rad: 0.7, mat: 2}
+];
+const MATERIALS = [
+  {r:0.9,g:0.2,b:0.2},
+  {r:0.7,g:0.7,b:0.7},
+  {r:0.2,g:0.3,b:0.9},
+  {r:0.9,g:0.9,b:0.9},
+  {r:0.1,g:0.1,b:0.1}
+];
+const LIGHTS = [
+  {x:-5,y:8,z:5,rad:1.5, r:15,g:15,b:15},
+  {x:5,y:5,z:2,rad:1.0, r:5,g:5,b:5}
+];
+
+// upload scene uniforms helper
+function setSceneUniforms(gl, prog){
+  gl.useProgram(prog);
+  // spheres
+  const sc = Math.min(8, SPHERES.length);
+  const sphereCountLoc = gl.getUniformLocation(prog, "u_sphereCount");
+  gl.uniform1i(sphereCountLoc, sc);
+  // spheres array
+  const arr = new Float32Array(4*8);
+  const matIdx = new Int32Array(8);
+  for(let i=0;i<sc;i++){
+    const s = SPHERES[i];
+    arr[i*4+0] = s.cx; arr[i*4+1] = s.cy; arr[i*4+2] = s.cz; arr[i*4+3] = s.rad;
+    matIdx[i] = s.mat|0;
+  }
+  // remaining zeros are fine
+  const spheresLoc = gl.getUniformLocation(prog, "u_spheres");
+  gl.uniform4fv(spheresLoc, arr);
+  const sMatLoc = gl.getUniformLocation(prog, "u_sphereMatIdx");
+  gl.uniform1iv(sMatLoc, matIdx);
+
+  // materials
+  const matCountLoc = gl.getUniformLocation(prog, "u_matCount");
+  gl.uniform1i(matCountLoc, MATERIALS.length);
+  const matsArr = new Float32Array(3*16); // shader expects up to 16
+  for(let i=0;i<MATERIALS.length;i++){
+    matsArr[i*3+0] = MATERIALS[i].r;
+    matsArr[i*3+1] = MATERIALS[i].g;
+    matsArr[i*3+2] = MATERIALS[i].b;
+  }
+  const matsLoc = gl.getUniformLocation(prog, "u_mats");
+  gl.uniform3fv(matsLoc, matsArr);
+
+  // lights
+  const lc = Math.min(8, LIGHTS.length);
+  const lightCountLoc = gl.getUniformLocation(prog, "u_lightCount");
+  gl.uniform1i(lightCountLoc, lc);
+  const lightsArr = new Float32Array(4*8);
+  const lcolsArr = new Float32Array(3*8);
+  for(let i=0;i<lc;i++){
+    const L = LIGHTS[i];
+    lightsArr[i*4+0] = L.x; lightsArr[i*4+1] = L.y; lightsArr[i*4+2] = L.z; lightsArr[i*4+3] = L.rad;
+    lcolsArr[i*3+0] = L.r; lcolsArr[i*3+1] = L.g; lcolsArr[i*3+2] = L.b;
+  }
+  const lightsLoc = gl.getUniformLocation(prog, "u_lights");
+  gl.uniform4fv(lightsLoc, lightsArr);
+  const lcolsLoc = gl.getUniformLocation(prog, "u_lightCols");
+  gl.uniform3fv(lcolsLoc, lcolsArr);
+}
+
+// setup once
+setSceneUniforms(gl, progSample);
+
+// attribute setup helper
+function bindQuadAttribs(gl, prog){
+  const loc = gl.getAttribLocation(prog, "a_pos");
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+// accumulation state
+let frameCount = 0;
+
+// camera state (match original: distance, azi, ele, target)
+let cam = {
+  dist: 7.0,
+  azi: Math.PI/2 + 0.5,
+  ele: 0.4,
+  target: {x:0, y:0.2, z:0}
+};
+function computeCamera(){
+  const y = cam.dist * Math.sin(cam.ele);
+  const r = cam.dist * Math.cos(cam.ele);
+  const camX = cam.target.x + r * Math.sin(cam.azi);
+  const camY = cam.target.y + y;
+  const camZ = cam.target.z + r * Math.cos(cam.azi);
+  let fx = cam.target.x - camX;
+  let fy = cam.target.y - camY;
+  let fz = cam.target.z - camZ;
+  const flen = Math.hypot(fx,fy,fz);
+  fx/=flen; fy/=flen; fz/=flen;
+  // right
+  let rx = fz, ry = 0, rz = -fx;
+  const rlen = Math.hypot(rx,ry,rz);
+  rx/=rlen; ry/=rlen; rz/=rlen;
+  // up = right x forward
+  const ux = ry * fz - rz * fy;
+  const uy = rz * fx - rx * fz;
+  const uz = rx * fy - ry * fx;
+  return {
+    pos: [camX, camY, camZ],
+    forward: [fx,fy,fz],
+    right: [rx,ry,rz],
+    up: [ux,uy,uz]
+  };
+}
+let camBasis = computeCamera();
+
+function resetAccumulation(){
+  frameCount = 0;
+  // clear accumulation texture to zero
+  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
+  gl.clearColor(0,0,0,0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// mouse interaction (orbit)
+let dragging = false, lastX=0, lastY=0;
+canvas.addEventListener('mousedown', (e)=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; });
+window.addEventListener('mouseup', ()=>{ dragging=false; });
+window.addEventListener('mousemove', (e)=>{
+  if(!dragging) return;
+  const dx = (e.clientX - lastX) * 0.005;
+  const dy = (e.clientY - lastY) * 0.005;
+  cam.azi -= dx;
+  cam.ele = Math.max(-1.5, Math.min(1.5, cam.ele + dy));
+  lastX = e.clientX; lastY = e.clientY;
+  camBasis = computeCamera();
+  resetAccumulation();
+});
+canvas.addEventListener('wheel', (e)=>{ e.preventDefault(); cam.dist = Math.max(2, Math.min(20, cam.dist + e.deltaY * 0.01)); camBasis = computeCamera(); resetAccumulation(); }, {passive:false});
+
+// render loop: draw sample into accumulation with additive blending, then display average
+function render(){
+  const w = canvas.width, h = canvas.height;
+
+  // 1) draw one sample into accumulation texture with additive blending
+  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
+  gl.viewport(0,0,w,h);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE); // add new sample to accumulation
+
+  gl.useProgram(progSample);
+  bindQuadAttribs(gl, progSample);
+
+  // uniforms for sample shader
+  gl.uniform2f(gl.getUniformLocation(progSample, "u_resolution"), w, h);
+  gl.uniform1f(gl.getUniformLocation(progSample, "u_time"), performance.now() * 0.001);
+  gl.uniform1i(gl.getUniformLocation(progSample, "u_frame"), frameCount);
+
+  // camera uniforms
+  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camPos"), camBasis.pos);
+  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camForward"), camBasis.forward);
+  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camRight"), camBasis.right);
+  gl.uniform3fv(gl.getUniformLocation(progSample, "u_camUp"), camBasis.up);
+
+  const fov = 2.0 * Math.atan( Math.tan(0.5) ); // keep similar to original code's vpH logic (approx)
+  gl.uniform1f(gl.getUniformLocation(progSample, "u_fov"), 0.9); // vertical fov in radians (experimentally chosen)
+  gl.uniform1f(gl.getUniformLocation(progSample, "u_aspect"), w / h);
+
+  // scene uniforms (spheres, materials, lights)
+  setSceneUniforms(gl, progSample);
+
+  // draw quad -> adds sample into accumulation texture
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.disable(gl.BLEND);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // 2) draw display pass: sample accumulation texture and divide by frameCount+1 -> show running average
+  gl.viewport(0,0,w,h);
+  gl.useProgram(progDisplay);
+  bindQuadAttribs(gl, progDisplay);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, accumTex);
+  gl.uniform1i(gl.getUniformLocation(progDisplay, "u_accum"), 0);
+  gl.uniform1i(gl.getUniformLocation(progDisplay, "u_frame"), frameCount + 1);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  frameCount++;
+  // update small status
+  msg.textContent = `Frame: ${frameCount} — ${w/dpr}×${h/dpr} px (dpr ${dpr.toFixed(1)})`;
+
+  requestAnimationFrame(render);
+}
+
+// initial clear & start
+resetAccumulation();
+requestAnimationFrame(render);
+
+</script>
+</body>
+</html>
